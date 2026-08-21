@@ -1,0 +1,9 @@
+# Core engine — ingestion and the HTTP clients it needs.
+requests>=2.31
+
+# Agent layer only (gapfinder/agent.py). The CLI, the coverage matrix and every
+# detector run without it.
+anthropic>=1.0
+
+# Nothing else is required: the database is stdlib sqlite3, the report is
+# hand-rendered HTML, and the tests use stdlib unittest.

@@ -1,9 +1,14 @@
 # Core engine — ingestion and the HTTP clients it needs.
 requests>=2.31
 
-# Agent layer only (gapfinder/agent.py). The CLI, the coverage matrix and every
-# detector run without it.
+# Agent layer only (gapfinder/agent.py, and `lab --mode agent`). The CLI, the
+# coverage matrix, every detector and the whole pipeline in dry mode run without it.
 anthropic>=1.0
 
-# Nothing else is required: the database is stdlib sqlite3, the report is
-# hand-rendered HTML, and the tests use stdlib unittest.
+# Optional: Mantis tracing (gapfinder/lab/tracing.py). Without it, reasoning
+# traces are still written to the run database and rendered by `lab --out`.
+# mantisdk>=0.1.6
+
+# Nothing else is required: the database is stdlib sqlite3, the simulations use
+# stdlib statistics, the reports are hand-rendered HTML, and the tests use
+# stdlib unittest.

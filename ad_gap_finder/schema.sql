@@ -170,3 +170,86 @@ CREATE TABLE IF NOT EXISTS gap_evidence (
     note      TEXT,
     PRIMARY KEY (gap_id, record_id, role)
 );
+
+-- ============================================================================
+-- Autonomous pipeline: runs, artifacts, provenance, gates, traces.
+--
+-- The pipeline is a stage machine (synthesis → hypothesis → analysis →
+-- in-silico → wet-lab) and these tables are what make it auditable rather than
+-- merely automatic. Every artifact records what it was derived from, every
+-- stage transition records the gate that allowed it, and every step emits a
+-- trace event. A wet-lab recommendation can therefore be walked back to the
+-- record ids it ultimately rests on.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY,
+    goal        TEXT NOT NULL,
+    mode        TEXT NOT NULL,               -- 'dry' (deterministic) | 'agent'
+    status      TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running','completed','awaiting_signoff',
+                                  'halted','failed')),
+    stage       TEXT,                        -- stage reached
+    halt_reason TEXT,
+    trace_id    TEXT,                        -- correlates with the tracing backend
+    started_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    ended_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+    stage       TEXT NOT NULL,
+    kind        TEXT NOT NULL,               -- brief | hypothesis | plan | simulation | recommendation
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,               -- JSON payload
+    digest      TEXT NOT NULL,               -- sha256 of body, so a rerun is detectable
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id, stage);
+
+-- Provenance edges. `parent_artifact` chains stages; `record_id` pins an
+-- artifact to the literature or dataset row that justifies it.
+CREATE TABLE IF NOT EXISTS artifact_links (
+    artifact_id     INTEGER NOT NULL REFERENCES artifacts (id) ON DELETE CASCADE,
+    parent_artifact INTEGER REFERENCES artifacts (id) ON DELETE CASCADE,
+    record_id       INTEGER REFERENCES records (id) ON DELETE CASCADE,
+    gap_id          INTEGER REFERENCES gaps (id) ON DELETE CASCADE,
+    role            TEXT NOT NULL DEFAULT 'derived_from'
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_artifact ON artifact_links (artifact_id);
+
+-- Gate decisions. A failed gate stops the run; both outcomes are recorded so a
+-- halt is as inspectable as a pass.
+CREATE TABLE IF NOT EXISTS gate_results (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+    gate        TEXT NOT NULL,
+    from_stage  TEXT NOT NULL,
+    to_stage    TEXT NOT NULL,
+    passed      INTEGER NOT NULL,
+    checks      TEXT NOT NULL DEFAULT '[]',  -- JSON: [{name, passed, detail}]
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+-- Local mirror of the trace stream. Written whether or not an external tracing
+-- backend is configured, so a run is never unexplainable because credentials
+-- were missing.
+CREATE TABLE IF NOT EXISTS trace_events (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+    span_id     TEXT NOT NULL,
+    parent_span TEXT,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,               -- stage | tool | llm | gate
+    status      TEXT NOT NULL DEFAULT 'ok',
+    input       TEXT,
+    output      TEXT,
+    attributes  TEXT NOT NULL DEFAULT '{}',
+    started_at  REAL NOT NULL,
+    ended_at    REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_run ON trace_events (run_id, started_at);

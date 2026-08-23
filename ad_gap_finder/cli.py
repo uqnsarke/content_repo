@@ -24,6 +24,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gapfinder import coverage, db, detectors, report  # noqa: E402
+from gapfinder.lab import pipeline as lab_pipeline  # noqa: E402
+from gapfinder.lab import artifacts as lab_artifacts  # noqa: E402
+from gapfinder.lab import viewer as lab_viewer  # noqa: E402
+from gapfinder.lab.stages import agent_mode_available  # noqa: E402
 from gapfinder.pipeline import ingest  # noqa: E402
 from gapfinder.sources import ADAPTERS  # noqa: E402
 
@@ -184,6 +188,95 @@ def cmd_demo(args):
     print("⚠️  synthetic corpus — the logic is real, the records are not")
 
 
+def cmd_lab(args):
+    """Run the autonomous pipeline: synthesis -> hypothesis -> analysis -> in-silico -> wet-lab."""
+    conn = _open(args)
+    status = lab_pipeline.mantis_status()
+    print(f"mantis: {'configured' if status['configured'] else 'local-only'}"
+          + (f" ({status['reason']})" if status.get("reason") else ""))
+
+    if args.mode == "agent" and not agent_mode_available():
+        sys.exit("agent mode needs the `anthropic` package and credentials "
+                 "(ANTHROPIC_API_KEY or `ant auth login`); use --mode dry otherwise")
+
+    goals = args.goal or ["Find the most tractable gap and take it to a wet-lab recommendation"]
+
+    if len(goals) > 1:
+        conn.close()
+        results = lab_pipeline.run_many(args.db, goals, args.mode, args.workers, args.model)
+        conn = db.connect(args.db)
+    else:
+        def on_event(kind, **kw):
+            if kind == "stage":
+                print(f"  {kw['stage']:<11s} -> artifact {kw['artifact'].id}: "
+                      f"{kw['artifact'].title[:70]}")
+            elif kind == "gate":
+                failed = [n for n, ok, _ in kw["checks"] if not ok]
+                # Waiting on a person is the designed ending, not a halt.
+                mark = ("pass" if kw["passed"]
+                        else "WAIT" if failed == ["human_signoff"] else "HALT")
+                print(f"  gate {kw['stage']}->{kw['to_stage']}: {mark}")
+                for name, ok, detail in kw["checks"]:
+                    if not ok:
+                        print(f"       - {name}: {detail}")
+        results = [lab_pipeline.run_pipeline(conn, goals[0], args.mode, args.model,
+                                             on_event=on_event,
+                                             enable_mantis=not args.no_mantis)]
+
+    for result in results:
+        print(f"\nrun {result.get('run_id')}: {result['status']} "
+              f"(reached {result.get('reached_stage')})")
+        if result.get("awaiting_human_signoff"):
+            print(f"  awaiting sign-off — review, then: "
+                  f"python cli.py signoff {result['run_id']}")
+        elif result.get("halt_reason"):
+            print(f"  halted: {result['halt_reason']}")
+
+    if args.out and results and results[0].get("run_id"):
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(lab_viewer.render(conn, results[0]["run_id"]))
+        print(f"\nwrote {out}")
+
+
+def cmd_runs(args):
+    conn = _open(args)
+    rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    if not rows:
+        sys.exit("no runs yet — try `python cli.py lab`")
+    for r in rows:
+        print(f"{r['id']:4d}  {r['status']:10s} {str(r['stage'] or '-'):10s} "
+              f"{r['mode']:6s} {r['goal'][:60]}")
+        if r["halt_reason"]:
+            print(f"      {r['halt_reason'][:100]}")
+
+
+def cmd_signoff(args):
+    """Record human approval on a wet-lab recommendation and close the run.
+
+    Deliberately a separate command a person runs. The pipeline cannot reach
+    this state on its own, which is the whole point of the final gate.
+    """
+    conn = _open(args)
+    row = conn.execute(
+        "SELECT * FROM artifacts WHERE run_id = ? AND stage = 'wetlab' ORDER BY id DESC LIMIT 1",
+        (args.run_id,)).fetchone()
+    if row is None:
+        sys.exit(f"run {args.run_id} has no wet-lab recommendation to approve")
+
+    body = json.loads(row["body"])
+    body["human_signoff"] = True
+    body["signed_off_by"] = args.by
+    conn.execute("UPDATE artifacts SET body = ? WHERE id = ?",
+                 (json.dumps(body, default=str), row["id"]))
+    lab_artifacts.finish_run(conn, args.run_id, "completed", "wetlab", None)
+    conn.commit()
+    print(f"run {args.run_id} signed off by {args.by}")
+    top = (body.get("experiments") or [{}])[0].get("name")
+    if top:
+        print(f"  approved first experiment: {top}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -239,6 +332,27 @@ def main(argv=None):
     s.set_defaults(fn=cmd_triage)
 
     add("stats").set_defaults(fn=cmd_stats)
+
+    s = add("lab")
+    s.add_argument("--goal", action="append",
+                   help="research goal; repeat for a fan-out across goals")
+    s.add_argument("--mode", choices=["dry", "agent"], default="dry",
+                   help="dry = deterministic, no model calls (default); agent = Claude narrates")
+    s.add_argument("--model", default="claude-opus-5")
+    s.add_argument("--workers", type=int, default=4)
+    s.add_argument("--out", default="run.html", help="write the run view here")
+    s.add_argument("--no-mantis", action="store_true",
+                   help="never initialise Mantis even if INSIGHT_* is set")
+    s.set_defaults(fn=cmd_lab)
+
+    s = add("runs")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_runs)
+
+    s = add("signoff")
+    s.add_argument("run_id", type=int)
+    s.add_argument("--by", default="unnamed reviewer")
+    s.set_defaults(fn=cmd_signoff)
 
     s = add("demo")
     s.add_argument("--limit", type=int, default=400)
